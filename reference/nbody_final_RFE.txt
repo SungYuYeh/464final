@@ -1,0 +1,297 @@
+#include <iostream>
+#include <vector>
+#include <omp.h>
+#include <cmath>
+#include <limits>
+#include <memory>
+
+struct Particle {
+    double x, y;
+    double vx, vy;
+    double mass;
+    double old_x, old_y;  // Store previous position for movement detection
+    bool has_moved;       // Flag to track if particle has moved
+};
+
+class QuadTree {
+public:
+    double x, y, width, height;
+    double total_mass;
+    double center_x, center_y;
+    Particle* particle;
+    std::unique_ptr<QuadTree> children[4];
+    bool isLeaf;
+    bool needsUpdate;     // Flag to track if node needs mass distribution update
+
+    QuadTree(double x, double y, double width, double height)
+        : x(x), y(y), width(width), height(height),
+          total_mass(0), center_x(0), center_y(0),
+          particle(nullptr), isLeaf(true), needsUpdate(false) {}
+
+    // Check if a particle has moved enough to warrant an update
+    bool hasSignificantMovement(const Particle* p) const {
+        if (!p) return false;
+        double threshold = width * 0.01; // 1% of cell width as threshold
+        return std::abs(p->x - p->old_x) > threshold || 
+               std::abs(p->y - p->old_y) > threshold;
+    }
+
+    // Update mass distribution only if necessary
+    void updateMassDistribution() {
+        if (!needsUpdate) return;
+
+        if (isLeaf && particle) {
+            total_mass = particle->mass;
+            center_x = particle->x;
+            center_y = particle->y;
+        } else {
+            total_mass = 0;
+            center_x = center_y = 0;
+
+            for (int i = 0; i < 4; ++i) {
+                if (children[i]) {
+                    children[i]->updateMassDistribution();
+                    total_mass += children[i]->total_mass;
+                    center_x += children[i]->center_x * children[i]->total_mass;
+                    center_y += children[i]->center_y * children[i]->total_mass;
+                }
+            }
+
+            if (total_mass > 0) {
+                center_x /= total_mass;
+                center_y /= total_mass;
+            }
+        }
+        needsUpdate = false;
+    }
+
+    void computeForces(Particle* p, double theta, double G, double softening) {
+        if (!p || (isLeaf && particle == p)) return;
+
+        double dx = center_x - p->x;
+        double dy = center_y - p->y;
+        double distance = std::sqrt(dx * dx + dy * dy) + softening;
+
+        if (isLeaf || (width / distance < theta)) {
+            if (distance > 0) {
+                double force = G * p->mass * total_mass / (distance * distance);
+                p->vx += (force * dx / distance) / p->mass;
+                p->vy += (force * dy / distance) / p->mass;
+            }
+        } else {
+            for (int i = 0; i < 4; ++i) {
+                if (children[i]) {
+                    children[i]->computeForces(p, theta, G, softening);
+                }
+            }
+        }
+    }
+
+    // Update or insert a particle
+    bool updateParticle(Particle* p) {
+        if (!p) return false;
+
+        if (isLeaf) {
+            if (!particle) {
+                particle = p;
+                needsUpdate = true;
+                return true;
+            }
+            
+            if (particle == p) {
+                if (hasSignificantMovement(p)) {
+                    needsUpdate = true;
+                }
+                return true;
+            }
+
+            // Need to subdivide
+            Particle* oldParticle = particle;
+            particle = nullptr;
+            subdivide();
+            isLeaf = false;
+            
+            return insertIntoChild(oldParticle) && insertIntoChild(p);
+        }
+        
+        return insertIntoChild(p);
+    }
+
+    // Remove a particle from the tree
+    bool removeParticle(Particle* p) {
+        if (!p) return false;
+
+        if (isLeaf) {
+            if (particle == p) {
+                particle = nullptr;
+                needsUpdate = true;
+                return true;
+            }
+            return false;
+        }
+
+        int index = getQuadrant(p->x, p->y);
+        if (children[index] && children[index]->removeParticle(p)) {
+            needsUpdate = true;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    void subdivide() {
+        for (int i = 0; i < 4; ++i) {
+            double childWidth = width / 2;
+            double childHeight = height / 2;
+            double childX = x + (i & 1) * childWidth;
+            double childY = y + (i >> 1) * childHeight;
+            children[i] = std::make_unique<QuadTree>(childX, childY, childWidth, childHeight);
+        }
+    }
+
+    bool insertIntoChild(Particle* p) {
+        int index = getQuadrant(p->x, p->y);
+        if (!children[index]) {
+            double childWidth = width / 2;
+            double childHeight = height / 2;
+            double childX = x + (index & 1) * childWidth;
+            double childY = y + (index >> 1) * childHeight;
+            children[index] = std::make_unique<QuadTree>(childX, childY, childWidth, childHeight);
+        }
+        needsUpdate = true;
+        return children[index]->updateParticle(p);
+    }
+
+    int getQuadrant(double px, double py) const {
+        int index = 0;
+        if (px >= x + width/2) index |= 1;
+        if (py >= y + height/2) index |= 2;
+        return index;
+    }
+};
+
+void updateParticles(std::vector<Particle>& particles, std::unique_ptr<QuadTree>& tree, 
+                    double dt, int numParticles, double G, double theta, double softening) {
+    // Update positions and store old positions
+    #pragma omp parallel for
+    for (int i = 0; i < numParticles; ++i) {
+        particles[i].old_x = particles[i].x;
+        particles[i].old_y = particles[i].y;
+        particles[i].x += particles[i].vx * dt;
+        particles[i].y += particles[i].vy * dt;
+        particles[i].has_moved = true;
+    }
+
+    bool needNewTree = false;
+    #pragma omp parallel for reduction(||:needNewTree)
+    for (int i = 0; i < numParticles; ++i) {
+        if (particles[i].has_moved) {
+            if (!tree->removeParticle(&particles[i]) || 
+                !tree->updateParticle(&particles[i])) {
+                needNewTree = true;
+            }
+            particles[i].has_moved = false;
+        }
+    }
+
+    // If tree needs complete rebuild
+    if (needNewTree) {
+        double maxPos = 0;
+        for (const auto& p : particles) {
+            maxPos = std::max(maxPos, std::max(std::abs(p.x), std::abs(p.y)));
+        }
+        tree = std::make_unique<QuadTree>(-maxPos*1.1, -maxPos*1.1, maxPos*2.2, maxPos*2.2);
+        for (int i = 0; i < numParticles; ++i) {
+            tree->updateParticle(&particles[i]);
+        }
+    }
+
+    tree->updateMassDistribution();
+
+    // Compute forces
+    #pragma omp parallel for
+    for (int i = 0; i < numParticles; ++i) {
+        tree->computeForces(&particles[i], theta, G, softening);
+    }
+}
+
+void simulate(int numParticles, int numSteps, double dt, double G, double theta, double softening) {
+    // Initialize particles
+    std::vector<Particle> particles(numParticles);
+    for (int i = 0; i < numParticles; ++i) {
+        particles[i] = {
+            static_cast<double>(rand() % 100),
+            static_cast<double>(rand() % 100),
+            0, 0,
+            static_cast<double>(rand() % 100 + 1),
+            0, 0,
+            false
+        };
+    }
+
+    // Initialize tree
+    double maxPos = 0;
+    for (const auto& p : particles) {
+        maxPos = std::max(maxPos, std::max(std::abs(p.x), std::abs(p.y)));
+    }
+    auto tree = std::make_unique<QuadTree>(-maxPos*1.1, -maxPos*1.1, maxPos*2.2, maxPos*2.2);
+    for (int i = 0; i < numParticles; ++i) {
+        tree->updateParticle(&particles[i]);
+    }
+
+    // Simulation statistics
+    double minVel = std::numeric_limits<double>::max();
+    double maxVel = std::numeric_limits<double>::lowest();
+    double totalVel = 0.0;
+    double startTime = omp_get_wtime();
+
+    // Main simulation loop
+    for (int step = 0; step < numSteps; ++step) {
+        updateParticles(particles, tree, dt, numParticles, G, theta, softening);
+
+        // Calculate statistics
+        #pragma omp parallel for reduction(min:minVel) reduction(max:maxVel) reduction(+:totalVel)
+        for (int i = 0; i < numParticles; ++i) {
+            double velocity = std::sqrt(particles[i].vx * particles[i].vx + 
+                                      particles[i].vy * particles[i].vy);
+            minVel = std::min(minVel, velocity);
+            maxVel = std::max(maxVel, velocity);
+            totalVel += velocity;
+        }
+    }
+
+    // Output results
+    double averageTime = (omp_get_wtime() - startTime) / numSteps * 1000;
+    double averageVel = totalVel / (numParticles * numSteps);
+
+    std::cout << "Number Objects: " << numParticles << std::endl;
+    std::cout << "Number Steps: " << numSteps << std::endl;
+    std::cout << "Timestep size: " << dt << std::endl;
+    std::cout << "OpenMP threads: " << omp_get_max_threads() << std::endl;
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "Velocity (min/max/avg): " << minVel << " / " << maxVel << " / " << averageVel << std::endl;    
+    std::cout << "Average time = " << averageTime << " (ms) per step with " 
+              << numParticles << " elements" << std::endl;
+    double gflops = (numParticles * numParticles * numSteps) / (averageTime * 1e6);
+    std::cout << "Average GFLOP/s: " << gflops << std::endl;
+}
+
+
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " <numParticles> <numSteps> <dt>" << std::endl;
+        return 1;
+    }
+
+    int numParticles = std::stoi(argv[1]);
+    int numSteps = std::stoi(argv[2]);
+    double dt = std::stod(argv[3]);
+
+    double G = 6.67430e-11;  // gravitational constant
+    double theta = 0.5;      // threshold for the Barnes-Hut algorithm
+    double softening = 1e-9; // softening factor
+
+    simulate(numParticles, numSteps, dt, G, theta, softening);
+
+    return 0;
+}

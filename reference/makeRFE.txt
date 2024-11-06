@@ -1,0 +1,34 @@
+COMMON	= ../common
+DBG	?=
+CXX	?= g++
+CXXFLAGS	= -O3 -I. -std=c++11 -I$(COMMON) $(DBG)
+
+OMPFLAGS	= -fopenmp
+
+ifeq ($(CXX),icpc)
+  CXXFLAGS	+= -xHost #-no-vec
+  CXXFLAGS	+= -qopt-report=5
+  CXXFLAGS	+= -Wunknown-pragmas # Disable warning about OpenMP pragma no defined.
+endif
+
+ifeq ($(CXX),g++)
+  CXXFLAGS	+= -mtune=native -march=native
+endif
+
+EXEC	= nbody-final nbody-final-omp
+
+all: $(EXEC)
+
+# Load common make options
+include $(COMMON)/Makefile.common
+LDFLAGS	= $(COMMON_LIBS)
+
+nbody-final: nbody-final.cpp $(COMMON_OBJS)
+        $(CXX) $(CXXFLAGS) -o nbody-final nbody-final.cpp $(COMMON_OBJS) $(LDFLAGS)
+
+nbody-final-omp: nbody-final.cpp $(COMMON_OBJS)
+        $(CXX) $(CXXFLAGS) -o nbody-final-omp nbody-final.cpp $(COMMON_OBJS) $(LDFLAGS) $(OMPFLAGS)
+
+
+clean: clean_common
+        /bin/rm -fv $(EXEC) *.o *.optrpt *.d
